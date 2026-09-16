@@ -1,0 +1,14 @@
+{
+  "name": "ext-automation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Orchestrator for the autonomous Chrome extension pipeline",
+  "scripts": {
+    "labels": "node tools/sync-labels.mjs",
+    "sync": "node tools/sync-projects.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  }
+}
