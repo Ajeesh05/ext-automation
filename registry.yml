@@ -1,0 +1,20 @@
+# Every project the orchestrator knows about. Adding a project means adding an
+# entry here and a project.yml in its repo.
+projects:
+  - name: mini-keep
+    repo: Ajeesh05/mini_keep
+    type: chrome-extension
+    autonomy: full
+    scan: monthly
+
+  - name: cookie-editor-and-storage-manager
+    repo: Ajeesh05/cookie_editor_and_storage_manager
+    type: chrome-extension
+    autonomy: propose
+    scan: biweekly
+
+  - name: gmeet-kit
+    repo: Ajeesh05/gmeet_kit
+    type: chrome-extension
+    autonomy: audit
+    scan: biweekly
