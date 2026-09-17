@@ -1,0 +1,63 @@
+# Read-only: asks the Chrome Web Store what it currently thinks of an item.
+#
+# Changes nothing. Useful for confirming credentials work, for checking what is
+# actually live before releasing, and for seeing whether the store has warned or
+# taken down an item.
+name: Chrome - status
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Project name as it appears in registry.yml (blank = all)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: chrome-web-store
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+
+      - name: Report
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+          CWS_SERVICE_ACCOUNT_KEY: ${{ secrets.CWS_SERVICE_ACCOUNT_KEY }}
+        run: |
+          names=$(node -e "
+            const {parse}=require('yaml');const fs=require('fs');
+            const r=parse(fs.readFileSync('registry.yml','utf8'));
+            const only='${{ inputs.project }}';
+            console.log(r.projects.filter(p=>!only||p.name===only).map(p=>p.name+' '+p.repo).join('\n'))")
+
+          echo "$names" | while read -r name repo; do
+            [ -n "$name" ] || continue
+            echo "::group::$name"
+            gh api "repos/$repo/contents/project.yml" --jq '.content' | base64 -d > /tmp/p.yml
+            eval "$(node -e "
+              const {parse}=require('yaml');const fs=require('fs');
+              const p=parse(fs.readFileSync('/tmp/p.yml','utf8'));
+              console.log('export CWS_PUBLISHER_ID='+p.store.publisher_id);
+              console.log('export CWS_ITEM_ID='+p.store.item_id)")"
+
+            if node tools/cws.mjs status > /tmp/out.txt 2>/tmp/err.txt; then
+              tail -n 12 /tmp/out.txt
+              {
+                echo "### $name"
+                echo '```'
+                tail -n 8 /tmp/out.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAILED:"; cat /tmp/err.txt
+              { echo "### $name"; echo '```'; cat /tmp/err.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+          done
