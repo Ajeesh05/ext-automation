@@ -1,0 +1,133 @@
+# Gate 1 of 2: upload a release to the Chrome Web Store as a DRAFT.
+#
+# Nothing here reaches users. The upload creates a draft revision; publishing it
+# is a separate, separately-approved workflow. That split is the whole point -
+# you see the version and the diff before anything is submitted for review.
+#
+# This is the only place in the system that holds store credentials, and it runs
+# no agent at all.
+name: Chrome - upload draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Project name as it appears in registry.yml
+        required: true
+      tag:
+        description: Release tag to ship (defaults to the latest release)
+        required: false
+
+concurrency:
+  group: chrome-upload-${{ inputs.project }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    # A GitHub Environment with you as required reviewer. A third independent
+    # lock: even a workflow run started by mistake pauses here for a human.
+    environment: chrome-web-store
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Resolve the project
+        id: project
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+        run: |
+          repo=$(node -e "
+            const {parse}=require('yaml');
+            const fs=require('fs');
+            const r=parse(fs.readFileSync('registry.yml','utf8'));
+            const p=r.projects.find(p=>p.name==='${{ inputs.project }}');
+            if(!p){console.error('Unknown project: ${{ inputs.project }}');process.exit(1)}
+            console.log(p.repo)
+          ")
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Shipping $repo @ $tag"
+
+      - name: Fetch the exact artifact that was tested
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+        run: |
+          mkdir -p dist
+          # The zip attached to the release, not a rebuild: this is the build CI
+          # actually verified.
+          gh release download "${{ steps.project.outputs.tag }}" \
+            --repo "${{ steps.project.outputs.repo }}" --pattern '*.zip' --dir dist
+          ls -la dist/
+
+      - name: Read the project's store identifiers
+        id: store
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+        run: |
+          gh api "repos/${{ steps.project.outputs.repo }}/contents/project.yml" \
+            --jq '.content' -H "Accept: application/vnd.github+json" | base64 -d > /tmp/project.yml
+
+          node -e "
+            const {parse}=require('yaml');const fs=require('fs');
+            const p=parse(fs.readFileSync('/tmp/project.yml','utf8'));
+            const pub=p?.store?.publisher_id, item=p?.store?.item_id;
+            if(!pub||!item){
+              console.error('project.yml has no store.publisher_id / store.item_id.');
+              console.error('Fill them in from the Developer Dashboard before releasing.');
+              process.exit(1);
+            }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'publisher='+pub+'\npublisher_set=true\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'item='+item+'\n');
+          "
+
+      - name: Upload as a draft
+        id: upload
+        env:
+          CWS_SERVICE_ACCOUNT_KEY: ${{ secrets.CWS_SERVICE_ACCOUNT_KEY }}
+          CWS_PUBLISHER_ID: ${{ steps.store.outputs.publisher }}
+          CWS_ITEM_ID: ${{ steps.store.outputs.item }}
+        run: |
+          zip=$(ls dist/*.zip | head -n1)
+          node tools/cws.mjs upload "$zip"
+
+      - name: Check what the store now thinks
+        id: status
+        env:
+          CWS_SERVICE_ACCOUNT_KEY: ${{ secrets.CWS_SERVICE_ACCOUNT_KEY }}
+          CWS_PUBLISHER_ID: ${{ steps.store.outputs.publisher }}
+          CWS_ITEM_ID: ${{ steps.store.outputs.item }}
+        run: node tools/cws.mjs status | tee /tmp/status.txt
+
+      - name: Ask for release approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            printf 'Uploaded **%s %s** to the Chrome Web Store as a draft.\n\n' \
+              "${{ inputs.project }}" "${{ steps.project.outputs.tag }}"
+            printf 'Nothing is live. The draft sits in the store until you decide.\n\n'
+            printf '```\n'; tail -n 20 /tmp/status.txt; printf '\n```\n\n'
+            printf 'Comment `/approve-release` to submit it for review, or\n'
+            printf '`/cancel-release` to withdraw the draft.\n\n'
+            printf 'Submitting is not publishing: Google reviews it first, and review\n'
+            printf 'can take days. The store watcher will report each state change here.\n'
+          } > /tmp/issue.md
+
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Release ${{ inputs.project }} ${{ steps.project.outputs.tag }}?" \
+            --label "awaiting-release-approval" \
+            --body-file /tmp/issue.md \
+            --assignee "${{ github.repository_owner }}"

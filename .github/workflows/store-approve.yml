@@ -1,0 +1,109 @@
+# Gate 2 of 2: submit an uploaded draft for review, or withdraw it.
+#
+#   /approve-release   submit the draft to Google for review
+#   /cancel-release    withdraw the pending submission
+name: Chrome - release approval
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  act:
+    if: >-
+      github.event.issue.pull_request == null &&
+      (startsWith(github.event.comment.body, '/approve-release') ||
+       startsWith(github.event.comment.body, '/cancel-release'))
+    runs-on: ubuntu-latest
+    environment: chrome-web-store
+    steps:
+      - name: Only the repository owner may release
+        env:
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$ASSOCIATION" != "OWNER" ]; then
+            echo "::error::$ACTOR is $ASSOCIATION, not OWNER - refusing to touch the store."
+            gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
+              --body "@$ACTOR only the repository owner can release to the store." || true
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+
+      - name: Work out which project this issue is about
+        id: project
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          # Title is "Release <project> <tag>?"
+          name=$(printf '%s' "$TITLE" | awk '{print $2}')
+          repo=$(node -e "
+            const {parse}=require('yaml');const fs=require('fs');
+            const r=parse(fs.readFileSync('registry.yml','utf8'));
+            const p=r.projects.find(p=>p.name===process.argv[1]);
+            if(!p){console.error('Unknown project: '+process.argv[1]);process.exit(1)}
+            console.log(p.repo)" "$name")
+
+          gh api "repos/$repo/contents/project.yml" --jq '.content' | base64 -d > /tmp/project.yml
+          node -e "
+            const {parse}=require('yaml');const fs=require('fs');
+            const p=parse(fs.readFileSync('/tmp/project.yml','utf8'));
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              'publisher='+p.store.publisher_id+'\nitem='+p.store.item_id+'\nname='+process.argv[1]+'\n')" "$name"
+
+      - name: Submit or withdraw
+        id: act
+        env:
+          CWS_SERVICE_ACCOUNT_KEY: ${{ secrets.CWS_SERVICE_ACCOUNT_KEY }}
+          CWS_PUBLISHER_ID: ${{ steps.project.outputs.publisher }}
+          CWS_ITEM_ID: ${{ steps.project.outputs.item }}
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          if printf '%s' "$BODY" | head -n1 | grep -q '^/cancel-release'; then
+            node tools/cws.mjs cancel | tee /tmp/out.txt
+            echo "action=cancelled" >> "$GITHUB_OUTPUT"
+          else
+            node tools/cws.mjs publish | tee /tmp/out.txt
+            echo "action=submitted" >> "$GITHUB_OUTPUT"
+          fi
+          node tools/cws.mjs status | tee -a /tmp/out.txt
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          if [ "${{ job.status }}" != "success" ]; then
+            gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body \
+              "Store request failed. Nothing was submitted. [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            exit 0
+          fi
+
+          if [ "${{ steps.act.outputs.action }}" = "cancelled" ]; then
+            gh issue edit "$ISSUE" --repo "${{ github.repository }}" --remove-label awaiting-release-approval
+            gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body "Draft withdrawn. Nothing was submitted."
+            gh issue close "$ISSUE" --repo "${{ github.repository }}"
+          else
+            gh issue edit "$ISSUE" --repo "${{ github.repository }}" \
+              --remove-label awaiting-release-approval --add-label released
+            {
+              printf 'Submitted to the Chrome Web Store.\n\n'
+              printf '**Submitted is not published.** Google reviews it first, which can take\n'
+              printf 'days. The store watcher checks every six hours and will report each\n'
+              printf 'state change here, including a rejection.\n\n'
+              printf '```\n'; tail -n 20 /tmp/out.txt; printf '\n```\n'
+            } > /tmp/c.md
+            gh issue comment "$ISSUE" --repo "${{ github.repository }}" --body-file /tmp/c.md
+          fi

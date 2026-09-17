@@ -1,0 +1,93 @@
+# Polls the Chrome Web Store for every submission still in flight.
+#
+# The API is the only honest source for what happened to a submission: publish
+# means submitted, and the outcome arrives days later with no notification. This
+# turns that into a comment on the issue you already have open, which GitHub
+# pushes to your phone.
+name: Chrome - store watch
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+
+      - name: Check every submission in flight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECTS_TOKEN: ${{ secrets.PROJECTS_PAT }}
+          CWS_SERVICE_ACCOUNT_KEY: ${{ secrets.CWS_SERVICE_ACCOUNT_KEY }}
+        run: |
+          issues=$(gh issue list --repo "${{ github.repository }}" \
+                   --label released --state open --json number,title --jq '.[] | @base64')
+          [ -n "$issues" ] || { echo "Nothing in flight."; exit 0; }
+
+          for row in $issues; do
+            issue=$(echo "$row" | base64 -d | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).number))")
+            title=$(echo "$row" | base64 -d | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).title))")
+            name=$(printf '%s' "$title" | awk '{print $2}')
+            echo "::group::$name (issue #$issue)"
+
+            repo=$(node -e "
+              const {parse}=require('yaml');const fs=require('fs');
+              const r=parse(fs.readFileSync('registry.yml','utf8'));
+              const p=r.projects.find(p=>p.name===process.argv[1]);
+              console.log(p ? p.repo : '')" "$name")
+            [ -n "$repo" ] || { echo "unknown project"; echo "::endgroup::"; continue; }
+
+            GH_TOKEN="$PROJECTS_TOKEN" gh api "repos/$repo/contents/project.yml" --jq '.content' \
+              | base64 -d > /tmp/project.yml
+            eval "$(node -e "
+              const {parse}=require('yaml');const fs=require('fs');
+              const p=parse(fs.readFileSync('/tmp/project.yml','utf8'));
+              console.log('export CWS_PUBLISHER_ID='+p.store.publisher_id);
+              console.log('export CWS_ITEM_ID='+p.store.item_id)")"
+
+            state=$(node tools/cws.mjs status --state 2>/tmp/err.txt) || {
+              echo "status check failed:"; cat /tmp/err.txt; echo "::endgroup::"; continue; }
+            echo "state: $state"
+
+            # Comment only on a change: the newest comment already naming this
+            # state means nothing has moved since last time.
+            latest=$(gh issue view "$issue" --repo "${{ github.repository }}" --json comments \
+                     --jq '.comments[-1].body // ""')
+            if printf '%s' "$latest" | grep -q "state: \`$state\`"; then
+              echo "unchanged"; echo "::endgroup::"; continue
+            fi
+
+            case "$state" in
+              PUBLISHED)
+                gh issue comment "$issue" --repo "${{ github.repository }}" --body \
+                  "**Live on the Chrome Web Store.** state: \`$state\`"
+                gh issue close "$issue" --repo "${{ github.repository }}"
+                ;;
+              REJECTED)
+                gh issue edit "$issue" --repo "${{ github.repository }}" --add-label store-rejected,risk:high
+                {
+                  printf '**Rejected by the Chrome Web Store.** state: `%s`\n\n' "$state"
+                  printf 'Open the Developer Dashboard for the reason - the API does not\n'
+                  printf 'return it. Paste it into this issue and the scanner will propose a\n'
+                  printf 'remediation on its next run.\n'
+                } > /tmp/rejected.md
+                gh issue comment "$issue" --repo "${{ github.repository }}" --body-file /tmp/rejected.md
+                ;;
+              *)
+                gh issue comment "$issue" --repo "${{ github.repository }}" --body \
+                  "Still in review. state: \`$state\`"
+                ;;
+            esac
+            echo "::endgroup::"
+          done
